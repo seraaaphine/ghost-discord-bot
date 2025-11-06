@@ -5,6 +5,20 @@ import yt_dlp
 import asyncio
 import os
 import subprocess
+import lyricsgenius
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+
+SPOTIFY_CLIENT_ID = "CLIENT_ID"
+SPOTIFY_CLIENT_SECRET = "SECRET_CLIENT"
+
+sp = spotipy.Spotify(client_credentials_manager=SpotifyClientCredentials(
+    client_id=SPOTIFY_CLIENT_ID,
+    client_secret=SPOTIFY_CLIENT_SECRET
+))
+
+genius = lyricsgenius.Genius("GENIUS_TOKEN")
+
 os.environ["PATH"] += os.pathsep + "E:\\FFMpeg\\ffmpeg-8.0-full_build\\ffmpeg-8.0-full_build\\bin"
 
 try:
@@ -44,7 +58,7 @@ class MusicPlayer:
     def __init__(self):
         self.queue = []
         self.current = None
-        self.loop = False  # Futuro: loop de música
+        self.loop = False
 
     def add(self, track):
         self.queue.append(track)
@@ -61,22 +75,39 @@ class MusicPlayer:
 async def play_next(voice_client: discord.VoiceClient):
     guild_id = voice_client.guild.id
     player = bot.players.get(guild_id)
-
     if not player:
         return
 
     next_track = player.get_next()
     if not next_track:
         player.current = None
-        await voice_client.disconnect()
+        if voice_client.is_connected():
+            await voice_client.disconnect()
         return
 
     player.current = next_track
-    source = discord.FFmpegPCMAudio(next_track['url'], **ffmpeg_options)
-    voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(voice_client), bot.loop))
-    
-    channel = bot.get_channel(voice_client.channel.id)
-    await channel.send(f"**Tocando** *{next_track['title']}*")
+
+    for attempt in range(3):
+        try:
+            source = discord.FFmpegPCMAudio(next_track['url'], **ffmpeg_options)
+            voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(voice_client), bot.loop))
+
+            if voice_client.is_connected():
+                channel = bot.get_channel(voice_client.channel.id)
+                if channel:
+                    await channel.send(f"Tocando: *{next_track['title']}*")
+
+            break 
+
+        except Exception as e:
+            print(f"[ERRO VOZ] Tentativa {attempt + 1}: {e}")
+            if voice_client.is_connected():
+                await voice_client.disconnect()
+            await asyncio.sleep(2)
+            try:
+                voice_client = await voice_client.channel.connect(reconnect=True, timeout=10)
+            except:
+                await asyncio.sleep(3)
 
 class YTDLSource(discord.PCMVolumeTransformer):
     def __init__(self, source, *, data, volume=0.5):
@@ -101,7 +132,6 @@ class GhostBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.all()
         super().__init__(command_prefix='!', intents=intents)
-
         self.players = {}
 
     async def setup_hook(self):
@@ -134,46 +164,101 @@ async def subtracao(interaction: discord.Interaction, numero1: int, numero2: int
 async def comando(interaction: discord.Interaction):
     await interaction.response.send_message(f"Se vemos numa próxima, {interaction.user.mention}! Até depois.")
 
-@bot.tree.command(name="play-music", description="Toca música a partir de um link do YouTube")
+@bot.tree.command(name="play-music", description="Adiciona música à fila")
 async def play(interaction: discord.Interaction, url: str):
     if not interaction.user.voice:
         await interaction.response.send_message("Você precisa estar em um canal de voz para usar este comando!", ephemeral=True)
         return
 
+    # Defer para ganhar tempo (evita o erro 10062)
+    await interaction.response.defer(ephemeral=False)
+
     channel = interaction.user.voice.channel
-    voice_client = interaction.guild.voice_client
-
-    await interaction.response.send_message(f"Procurando `{url}`...", ephemeral=False)
-
-    if not voice_client:
-        voice_client = await channel.connect(reconnect=True)
+    voice_client = interaction.guild.voice_client or await channel.connect(reconnect=True)
 
     guild_id = interaction.guild.id
-    if guild_id not in bot.players:
-        bot.players[guild_id] = MusicPlayer()
+    player = bot.players.setdefault(guild_id, MusicPlayer())
 
-    player = bot.players[guild_id]
+    data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+    if 'entries' in data:
+        data = data['entries'][0]
 
-    try:
-        data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
-        if 'entries' in data:
-            data = data['entries'][0]
+    track = {
+        'title': data['title'],
+        'url': data['url'],
+        'requester': interaction.user
+    }
 
-        track = {
-            'title': data['title'],
-            'url': data['url'],
-            'requester': interaction.user
-        }
+    player.add(track)
 
-        player.add(track)
+    if not voice_client.is_playing():
+        await play_next(voice_client)
+        await interaction.followup.send(f"**Tocando:** {track['title']}")
+    else:
+        await interaction.followup.send(f"**Adicionado à fila:** {track['title']}")
 
-        if not voice_client.is_playing():
-            await play_next(voice_client)
-        else:
-            await interaction.followup.send(f"Adicionado à fila: **{track['title']}**")
+@bot.tree.command(name="playlist", description="Adiciona playlist inteira à fila")
+async def playlist(interaction: discord.Interaction, url: str):
+    if not interaction.user.voice:
+        await interaction.response.send_message("Entre em um canal de voz!", ephemeral=True)
+        return
 
-    except Exception as e:
-        await interaction.followup.send(f"Erro: `{e}`")
+    await interaction.response.send_message("Carregando playlist...", ephemeral=False)
+
+    channel = interaction.user.voice.channel
+    voice_client = interaction.guild.voice_client or await channel.connect(reconnect=True)
+    player = bot.players.setdefault(interaction.guild.id, MusicPlayer())
+
+    data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+    if not data or 'entries' not in data:
+        await interaction.followup.send("Playlist não encontrada ou vazia.")
+        return
+
+    adicionadas = 0
+    for entry in data['entries']:
+        if entry:
+            track = {
+                'title': entry.get('title', 'Desconhecido'),
+                'url': entry.get('url'),
+                'requester': interaction.user
+            }
+            player.add(track)
+            adicionadas += 1
+
+    if not voice_client.is_playing():
+        await play_next(voice_client)
+
+    await interaction.followup.send(f"**{adicionadas} músicas** adicionadas da playlist!")
+
+@bot.tree.command(name="lyrics", description="Mostra a letra da música atual")
+async def lyrics(interaction: discord.Interaction):
+    player = bot.players.get(interaction.guild.id)
+    if not player or not player.current:
+        await interaction.response.send_message("Nenhuma música tocando.", ephemeral=True)
+        return
+
+    title = player.current['title']
+    artist = player.current.get('artist', "")
+
+    await interaction.response.send_message(f"Buscando a letra de **{title}**...", ephemeral=True)
+
+    song = genius.search_song(title, artist=artist)
+
+    if not song:
+        await interaction.followup.send("Letra não encontrada.", ephemeral=True)
+        return
+
+    lyrics = song.lyrics
+    if len(lyrics) > 1900:
+        lyrics = lyrics[:1900] + "\n\n[... letra cortada]"
+
+    embed = discord.Embed(
+        title=f"Letra: {song.title}",
+        description=lyrics,
+        color=0xffd700
+    )
+    embed.set_footer(text="Fonte: Genius.com")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="pause", description="Pausa a música")
 async def pause(interaction: discord.Interaction):
@@ -195,13 +280,15 @@ async def resume(interaction: discord.Interaction):
 
 @bot.tree.command(name="music-queue", description="Mostra a fila de músicas")
 async def queue(interaction: discord.Interaction):
+    await interaction.response.send_message("Carregando fila...", ephemeral=True)
+
     player = bot.players.get(interaction.guild.id)
     if not player or not player.queue and not player.current:
-        await interaction.response.send_message("A fila está vazia.", ephemeral=True)
+        await interaction.followup.send("A fila está vazia.", ephemeral=True)
         return
 
     embed = discord.Embed(title="Fila de Músicas", color=0x00ff00)
-    
+
     if player.current:
         embed.add_field(name="Tocando Agora", value=f"**{player.current['title']}**", inline=False)
 
@@ -211,7 +298,17 @@ async def queue(interaction: discord.Interaction):
         if len(player.queue) > 10:
             embed.set_footer(text=f"E mais {len(player.queue) - 10} músicas...")
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="remove", description="Remove música da fila")
+async def remove(interaction: discord.Interaction, posicao: int):
+    player = bot.players.get(interaction.guild.id)
+    if not player or not player.queue or posicao < 1 or posicao > len(player.queue):
+        await interaction.response.send_message("Posição inválida ou fila vazia.", ephemeral=True)
+        return
+
+    removida = player.queue.pop(posicao - 1)
+    await interaction.response.send_message(f"Removido: **{removida['title']}**")
 
 @bot.tree.command(name="skip-music", description="Pula a música atual")
 async def skip(interaction: discord.Interaction):
