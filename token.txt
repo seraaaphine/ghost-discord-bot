@@ -1,1 +1,7 @@
-MTQyNTgxNDEyOTAyMDUwMjEwNw.GQg_ry.tlDKfR1Bw0NfDsdaPFhzTcSyCennm3SLmz-ScE
+DISCORD_TOKEN = Discord Application
+
+GENIUS_TOKEN = Genius
+
+CLIENT_ID = Spotify Client ID
+
+SECRET_CLIENT = Spotify Client Secret
