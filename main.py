@@ -236,4 +236,4 @@ async def stop(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("Não estou em voz.", ephemeral=True)
 
-bot.run("MTQyNTgxNDEyOTAyMDUwMjEwNw.GQg_ry.tlDKfR1Bw0NfDsdaPFhzTcSyCennm3SLmz-ScE")
+bot.run("DISCORD_TOKEN")
